@@ -1,6 +1,9 @@
 import { streamText, type ModelMessage } from 'ai';
 import { z } from 'zod';
-import { llama, VLM_MODEL, LLAMA_SERVER_URL } from '@/lib/llm';
+import { llama, VLM_MODEL, LLAMA_SERVER_URL, MLX_VLM_BASE_URL, llama72b, VLM_72B_MODEL, LLAMA_72B_SERVER_URL } from '@/lib/llm';
+
+// 72B の推論は数分かかる場合があるため、デプロイ時のタイムアウトを延長
+export const maxDuration = 600;
 
 const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
 const MAX_FRAMES = 12;
@@ -45,6 +48,73 @@ function validateImageFile(file: File): { ok: true } | { ok: false; status: numb
   return { ok: true };
 }
 
+async function handleMlxNative(form: FormData, prompt: string): Promise<Response> {
+  const videoField = form.get('video');
+  const imageField = form.get('image');
+
+  if (!(videoField instanceof File) && !(imageField instanceof File)) {
+    return json(400, { error: '`video` or `image` field required for mlx_native mode' });
+  }
+
+  const proxyForm = new FormData();
+  proxyForm.append('prompt', prompt);
+  if (videoField instanceof File) {
+    proxyForm.append('video', videoField);
+  } else {
+    proxyForm.append('image', imageField as File);
+  }
+
+  let upstream: Response;
+  try {
+    upstream = await fetch(`${MLX_VLM_BASE_URL}/v1/infer`, {
+      method: 'POST',
+      body: proxyForm,
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return json(503, {
+      error: 'mlx-vlm-server unreachable',
+      url: MLX_VLM_BASE_URL,
+      detail: message,
+    });
+  }
+
+  if (!upstream.ok) {
+    let detail = `HTTP ${upstream.status}`;
+    try {
+      const body = await upstream.json();
+      detail = body.detail ?? detail;
+    } catch {
+      // body wasn't JSON
+    }
+    return json(upstream.status >= 500 ? 502 : upstream.status, {
+      error: 'mlx inference failed',
+      detail,
+    });
+  }
+
+  return new Response(upstream.body, {
+    headers: { 'content-type': 'text/plain; charset=utf-8' },
+  });
+}
+
+export async function GET(): Promise<Response> {
+  const [mlxResult, llama72bResult] = await Promise.allSettled([
+    fetch(`${MLX_VLM_BASE_URL}/v1/health`, { signal: AbortSignal.timeout(3000) }).then((r) => r.json()),
+    fetch(`${LLAMA_72B_SERVER_URL.replace('/v1', '')}/health`, { signal: AbortSignal.timeout(3000) }).then((r) => r.json()),
+  ]);
+
+  return new Response(
+    JSON.stringify({
+      llama_server_url: LLAMA_SERVER_URL,
+      llama_72b_server_url: LLAMA_72B_SERVER_URL,
+      mlx: mlxResult.status === 'fulfilled' ? mlxResult.value : { loaded: false, error: 'unreachable' },
+      llama_72b: llama72bResult.status === 'fulfilled' ? { loaded: true } : { loaded: false, error: 'unreachable' },
+    }),
+    { headers: { 'content-type': 'application/json' } },
+  );
+}
+
 export async function POST(request: Request): Promise<Response> {
   let form: FormData;
   try {
@@ -62,6 +132,18 @@ export async function POST(request: Request): Promise<Response> {
     return json(400, { error: 'invalid prompt', detail: promptResult.error.issues });
   }
   const prompt = promptResult.data;
+
+  const mode = form.get('mode') ?? 'llama_cpp';
+  if (mode === 'mlx_native') {
+    return handleMlxNative(form, prompt);
+  }
+
+  // llama_cpp か llama_cpp_72b かでモデル/サーバーを切り替える
+  const is72b = mode === 'llama_cpp_72b';
+  const activeModel = is72b ? llama72b(VLM_72B_MODEL) : llama(VLM_MODEL);
+  const activeServerUrl = is72b ? LLAMA_72B_SERVER_URL : LLAMA_SERVER_URL;
+
+  // --- llama_cpp path ---
 
   const frameFields = form.getAll('frames').filter((v): v is File => v instanceof File);
   const imageField = form.get('image');
@@ -109,10 +191,7 @@ export async function POST(request: Request): Promise<Response> {
       ];
 
   try {
-    const result = streamText({
-      model: llama(VLM_MODEL),
-      messages,
-    });
+    const result = streamText({ model: activeModel, messages });
     return result.toTextStreamResponse();
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -120,7 +199,7 @@ export async function POST(request: Request): Promise<Response> {
     if (isConnRefused) {
       return json(503, {
         error: 'llama-server unreachable',
-        url: LLAMA_SERVER_URL,
+        url: activeServerUrl,
         detail: message,
       });
     }
